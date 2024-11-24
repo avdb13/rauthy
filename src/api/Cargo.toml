@@ -33,6 +33,10 @@ validator = { workspace = true }
 atrium-api = { workspace = true }
 atrium-identity = { workspace = true }
 atrium-oauth-client = { workspace = true }
+atrium-xrpc = { workspace = true }
+ring = { workspace = true }
+
+hickory-resolver = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = "1"

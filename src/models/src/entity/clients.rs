@@ -34,7 +34,7 @@ use std::time::Duration;
 use tracing::{debug, error, trace, warn};
 use validator::Validate;
 
-static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+pub(super) static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 /**
 # OIDC Client

@@ -153,3 +153,42 @@ pub fn validate_vec_scopes(value: &[String]) -> Result<(), ValidationError> {
     }
     Ok(())
 }
+
+pub fn validate_vec_jwks(_value: &[String]) -> Result<(), ValidationError> {
+    todo!()
+}
+
+pub mod atproto {
+    use rauthy_common::constants::atproto::{RE_GRANT_TYPES, RE_SCOPE_SPACE};
+    use validator::ValidationError;
+
+    pub fn validate_vec_grant_types(value: &[String]) -> Result<(), ValidationError> {
+        let mut err = None;
+
+        value.iter().for_each(|v| {
+            if !RE_GRANT_TYPES.is_match(v) {
+                err = Some("^(authorization_code|refresh_token)$");
+            }
+        });
+
+        if let Some(e) = err {
+            return Err(ValidationError::new(e));
+        }
+        Ok(())
+    }
+
+    pub fn validate_vec_scopes(value: &[String]) -> Result<(), ValidationError> {
+        let mut err = None;
+
+        value.iter().for_each(|v| {
+            if !RE_SCOPE_SPACE.is_match(v) {
+                err = Some("^(atproto|transition:generic|transition:chat.bsky)$");
+            }
+        });
+
+        if let Some(e) = err {
+            return Err(ValidationError::new(e));
+        }
+        Ok(())
+    }
+}

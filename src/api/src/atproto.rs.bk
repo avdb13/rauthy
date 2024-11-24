@@ -1,0 +1,150 @@
+/// Returns all existing atproto clients with all their information.
+///
+/// **Permissions**
+/// - rauthy_admin
+#[utoipa::path(
+    get,
+    path = "/atproto/clients",
+    tag = "atproto",
+    responses(
+        (status = 200, description = "Ok", body = OAuthClientMetadata),
+    ),
+)]
+#[tracing::instrument(skip_all)]
+#[get("/atproto/clients")]
+pub async fn get_clients(principal: ReqPrincipal) -> Result<HttpResponse, ErrorResponse> {
+    principal.validate_api_key_or_admin_session(AccessGroup::Clients, AccessRights::Read)?;
+
+    Ok(HttpResponse::Ok().json(Vec::new()))
+}
+
+/// Returns a single atproto clients by its *id* with all information's.
+///
+/// **Permissions**
+/// - rauthy_admin
+#[utoipa::path(
+    get,
+    path = "/atproto/clients/{id}",
+    tag = "atproto",
+    responses(
+        (status = 200, description = "Ok", body = OAuthClientMetadata),
+    ),
+)]
+#[get("/atproto/clients/{id}")]
+pub async fn get_client_by_id(
+    path: web::Path<String>,
+    principal: ReqPrincipal,
+) -> Result<HttpResponse, ErrorResponse> {
+    principal.validate_api_key_or_admin_session(AccessGroup::Clients, AccessRights::Read)?;
+
+    todo!()
+}
+
+/// Adds a new atproto client to the database.
+///
+/// **Permissions**
+/// - rauthy_admin
+#[utoipa::path(
+    post,
+    path = "/atproto/clients",
+    tag = "clients",
+    request_body = atproto::NewClientRequest,
+    responses(
+        (status = 200, description = "Ok"),
+    ),
+)]
+#[post("/atproto/clients")]
+pub async fn post_clients(
+    data: web::Data<AppState>,
+    client: actix_web_validator::Json<atproto::NewClientRequest>,
+    principal: ReqPrincipal,
+) -> Result<HttpResponse, ErrorResponse> {
+    principal.validate_api_key_or_admin_session(AccessGroup::Clients, AccessRights::Create)?;
+
+    let http_client = Arc::new(atrium_oauth_client::DefaultHttpClient::default());
+    let config = OAuthClientConfig {
+        client_metadata: AtprotoLocalhostClientMetadata {
+            redirect_uris: Some(vec![String::from("http://127.0.0.1/callback")]),
+            scopes: Some(vec![
+                Scope::Known(KnownScope::Atproto),
+                Scope::Known(KnownScope::TransitionGeneric),
+            ]),
+        },
+        keys: None,
+        resolver: OAuthResolverConfig {
+            did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
+                plc_directory_url: DEFAULT_PLC_DIRECTORY_URL.to_string(),
+                http_client: http_client.clone(),
+            }),
+            handle_resolver: AtprotoHandleResolver::new(AtprotoHandleResolverConfig {
+                dns_txt_resolver: HickoryDnsTxtResolver::default(),
+                http_client: http_client.clone(),
+            }),
+            authorization_server_metadata: Default::default(),
+            protected_resource_metadata: Default::default(),
+        },
+        state_store: MemoryStateStore::default(),
+        session_store: MemorySessionStore::default(),
+    };
+    let client = OAuthClient::new(config)?;
+    println!(
+        "Authorization url: {}",
+        client
+            .authorize(
+                std::env::var("HANDLE").unwrap_or(String::from("https://bsky.social")),
+                AuthorizeOptions {
+                    scopes: vec![
+                        Scope::Known(KnownScope::Atproto),
+                        Scope::Known(KnownScope::TransitionGeneric)
+                    ],
+                    ..Default::default()
+                }
+            )
+            .await?
+    );
+
+    // Click the URL and sign in,
+    // then copy and paste the URL like “http://127.0.0.1/?iss=...&code=...” after it is redirected.
+
+    print!("Redirected url: ");
+    stdout().lock().flush()?;
+    let mut url = String::new();
+    stdin().lock().read_line(&mut url)?;
+
+    let uri = url.trim().parse::<Uri>()?;
+    let params = serde_html_form::from_str(uri.query().unwrap())?;
+
+    let session_manager = client.callback::<MemoryMapStore<(), Session>>(params).await?;
+    let session = session_manager.get_session(false).await?;
+    println!("{}", serde_json::to_string_pretty(&session)?);
+
+    let agent = Agent::new(session_manager);
+    let session = agent.api.com.atproto.server.get_session().await?;
+    println!("{:?}", &session.data);
+
+    let parts = data.public_url.parse().map(Uri::into_parts);
+
+    let client_id = Uri::from_parts(Parts {
+        path_and_query: Some(format!("/atproto/clients/{id}").parse().expect("todo")),
+        ..parts.expect("invalid public_url in AppState")
+    });
+
+    let metadata = OAuthClientMetadata {
+        client_id: client_id.map(Uri::to_string).expect("todo"),
+        client_uri: None,
+        redirect_uris: client.redirect_uris,
+        scope: Some(format!("atproto {}", client.scopes.concat())),
+        grant_types: Some(
+            iter::once("authorization_code".to_owned())
+                .chain(client.flows_enabled)
+                .collect(),
+        ),
+        token_endpoint_auth_method: Some("private_key_jwt".to_owned()),
+        token_endpoint_auth_signing_alg: Some("ES256".to_owned()),
+        dpop_bound_access_tokens: Some(true),
+        jwks_uri: todo!(),
+        jwks: todo!(),
+    };
+
+    Ok(HttpResponse::Ok())
+}

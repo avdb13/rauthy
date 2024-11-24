@@ -729,7 +729,7 @@ impl AuthProviderCallback {
         Ok(())
     }
 
-    async fn find(callback_id: String) -> Result<Self, ErrorResponse> {
+    pub async fn find(callback_id: String) -> Result<Self, ErrorResponse> {
         let opt: Option<Self> = DB::client()
             .get(Cache::AuthProviderCallback, callback_id)
             .await?;
@@ -974,6 +974,213 @@ impl AuthProviderCallback {
                 return Err(ErrorResponse::new(ErrorResponseType::Internal, err));
             }
         };
+
+        user.check_enabled()?;
+        user.check_expired()?;
+
+        if link_cookie.is_some() {
+            // If this is the case, we don't need to validate any further client values.
+            // We will not generate a new auth code at all -> this is just a request to federate
+            // an existing account. The federation has been done in the step above already.
+            return Ok((
+                AuthStep::ProviderLink,
+                AuthProviderLinkCookie::deletion_cookie(),
+            ));
+        }
+
+        // validate client values
+        let client = Client::find_maybe_ephemeral(slf.req_client_id).await?;
+        let force_mfa = client.force_mfa();
+        if force_mfa {
+            if provider_mfa_login == ProviderMfaLogin::No && !user.has_webauthn_enabled() {
+                return Err(ErrorResponse::new(
+                    ErrorResponseType::MfaRequired,
+                    "MFA is required for this client",
+                ));
+            }
+            session.set_mfa(true).await?;
+        }
+        client.validate_redirect_uri(&slf.req_redirect_uri)?;
+        client.validate_code_challenge(&slf.req_code_challenge, &slf.req_code_challenge_method)?;
+        let header_origin = client.validate_origin(req, &data.listen_scheme, &data.public_url)?;
+
+        // ######################################
+        // all good, we can generate an auth code
+
+        // authorization code
+        let code_lifetime = if force_mfa && user.has_webauthn_enabled() {
+            client.auth_code_lifetime + *WEBAUTHN_REQ_EXP as i32
+        } else {
+            client.auth_code_lifetime
+        };
+        let scopes = client.sanitize_login_scopes(&slf.req_scopes)?;
+        let code = AuthCode::new(
+            user.id.clone(),
+            client.id,
+            Some(session.id.clone()),
+            slf.req_code_challenge,
+            slf.req_code_challenge_method,
+            slf.req_nonce,
+            scopes,
+            code_lifetime,
+        );
+        code.save().await?;
+
+        // location header
+        let mut loc = format!("{}?code={}", slf.req_redirect_uri, code.id);
+        if let Some(state) = slf.req_state {
+            write!(loc, "&state={}", state)?;
+        };
+
+        let auth_step = if user.has_webauthn_enabled() {
+            let step = AuthStepAwaitWebauthn {
+                code: get_rand(48),
+                header_csrf: Session::get_csrf_header(&session.csrf_token),
+                header_origin,
+                user_id: user.id.clone(),
+                email: user.email,
+                exp: *WEBAUTHN_REQ_EXP,
+                session,
+            };
+
+            WebauthnLoginReq {
+                code: step.code.clone(),
+                user_id: user.id,
+                header_loc: loc,
+                header_origin: step
+                    .header_origin
+                    .as_ref()
+                    .map(|h| h.1.to_str().unwrap().to_string()),
+            }
+            .save()
+            .await?;
+
+            AuthStep::AwaitWebauthn(step)
+        } else {
+            AuthStep::LoggedIn(AuthStepLoggedIn {
+                user_id: user.id,
+                email: user.email,
+                header_loc: (header::LOCATION, HeaderValue::from_str(&loc)?),
+                header_csrf: Session::get_csrf_header(&session.csrf_token),
+                header_origin,
+            })
+        };
+
+        // callback data deletion cookie
+        let cookie = ApiCookie::build(COOKIE_UPSTREAM_CALLBACK, "", 0);
+        Ok((auth_step, cookie))
+    }
+
+    pub async fn atproto_login_validate<'a>(
+        req: &'a HttpRequest,
+        payload: &'a ProviderCallbackRequest,
+        session: Session,
+    ) -> Result<(), ErrorResponse> {
+        // the callback id for the cache should be inside the encrypted cookie
+        let callback_id = ApiCookie::from_req(req, COOKIE_UPSTREAM_CALLBACK).ok_or_else(|| {
+            ErrorResponse::new(
+                ErrorResponseType::Forbidden,
+                "Missing encrypted callback cookie",
+            )
+        })?;
+
+        // validate state
+        if callback_id != payload.state {
+            Self::delete(callback_id).await?;
+
+            error!("`state` does not match");
+            return Err(ErrorResponse::new(
+                ErrorResponseType::BadRequest,
+                "`state` does not match",
+            ));
+        }
+        debug!("callback state is valid");
+
+        // validate csrf token
+        let slf = Self::find(callback_id).await?;
+        if slf.xsrf_token != payload.xsrf_token {
+            Self::delete(slf.callback_id).await?;
+
+            error!("invalid CSRF token");
+            return Err(ErrorResponse::new(
+                ErrorResponseType::Unauthorized,
+                "invalid CSRF token",
+            ));
+        }
+        debug!("callback csrf token is valid");
+
+        // validate PKCE verifier
+        let hash = digest::digest(&digest::SHA256, payload.pkce_verifier.as_bytes());
+        let hash_base64 = base64_url_encode(hash.as_ref());
+        if slf.pkce_challenge != hash_base64 {
+            Self::delete(slf.callback_id).await?;
+
+            error!("invalid PKCE verifier");
+            return Err(ErrorResponse::new(
+                ErrorResponseType::Unauthorized,
+                "invalid PKCE verifier",
+            ));
+        }
+        debug!("callback pkce verifier is valid");
+
+        Ok(())
+    }
+
+    /// In case of any error, the callback code will be fully deleted for security reasons.
+    pub async fn atproto_login_finish<'a>(
+        data: &'a web::Data<AppState>,
+        req: &'a HttpRequest,
+        payload: &'a ProviderCallbackRequest,
+        mut session: Session,
+        sub: &str,
+    ) -> Result<(AuthStep, Cookie<'a>), ErrorResponse> {
+        // the callback id for the cache should be inside the encrypted cookie
+        let callback_id = ApiCookie::from_req(req, COOKIE_UPSTREAM_CALLBACK).ok_or_else(|| {
+            ErrorResponse::new(
+                ErrorResponseType::Forbidden,
+                "Missing encrypted callback cookie",
+            )
+        })?;
+
+        // validate state
+        if callback_id != payload.state {
+            Self::delete(callback_id).await?;
+
+            error!("`state` does not match");
+            return Err(ErrorResponse::new(
+                ErrorResponseType::BadRequest,
+                "`state` does not match",
+            ));
+        }
+        debug!("callback state is valid");
+
+        // validate csrf token
+        let slf = Self::find(callback_id).await?;
+        let provider = AuthProvider::find(&slf.provider_id).await?;
+
+        // extract a possibly existing provider link cookie for
+        // linking an existing account to a provider
+        let link_cookie = ApiCookie::from_req(req, PROVIDER_LINK_COOKIE)
+            .and_then(|value| AuthProviderLinkCookie::try_from(value.as_str()).ok());
+
+        let claims = AuthProviderIdClaims {
+            sub: Some(serde_json::Value::String(sub.to_owned())),
+            id: None,
+            uid: None,
+            email: None,
+            email_verified: None,
+            name: None,
+            given_name: None,
+            family_name: None,
+            address: None,
+            birthdate: None,
+            locale: None,
+            phone: None,
+            json_bytes: None,
+        };
+        // deserialize payload and validate the information
+        let (user, provider_mfa_login) =
+            claims.validate_update_user(&provider, &link_cookie).await?;
 
         user.check_enabled()?;
         user.check_expired()?;

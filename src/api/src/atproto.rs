@@ -1,119 +1,237 @@
-use std::iter;
+use std::sync::Arc;
 
 use actix_web::{
-    get,
-    http::{
-        header::LOCATION,
-        uri::{Parts, PathAndQuery},
-        Uri,
-    },
-    post, put, web, HttpRequest, HttpResponse,
+    http::header::{HeaderValue, LOCATION},
+    post, web, HttpRequest, HttpResponse,
 };
 use actix_web_validator::{Json, Query};
+use atrium_identity::{
+    did::{CommonDidResolver, CommonDidResolverConfig, DEFAULT_PLC_DIRECTORY_URL},
+    handle::{AtprotoHandleResolver, AtprotoHandleResolverConfig},
+};
 use atrium_oauth_client::{
-    AtprotoClientMetadata, AuthMethod, AuthorizeOptions, CallbackParams, GrantType,
-    OAuthClientMetadata,
+    store::{session::MemorySessionStore, state::MemoryStateStore},
+    AtprotoClientMetadata, AuthMethod, AuthorizeOptions, CallbackParams, DefaultHttpClient,
+    GrantType, KnownScope, OAuthClientConfig, OAuthResolverConfig, Scope,
 };
-use cryptr::utils::secure_random_alnum;
-use rauthy_api_types::atproto;
-use rauthy_error::ErrorResponse;
-use rauthy_models::{
-    app_state::AppState,
-    entity::{
-        api_keys::{AccessGroup, AccessRights},
-        auth_providers::{AuthProvider, AuthProviderCallback, AuthProviderType},
-        clients::Client,
-    },
+use rauthy_api_types::{
+    atproto,
+    auth_providers::{ProviderCallbackRequest, ProviderLoginRequest},
 };
+use rauthy_error::{ErrorResponse, ErrorResponseType};
+use rauthy_models::{app_state::AppState, entity::auth_providers::AuthProviderCallback};
+use tokio::sync::OnceCell;
 
-use crate::ReqPrincipal;
+use crate::{map_auth_step, ReqPrincipal};
+use resolvers::DnsTxtResolver;
 
-/// Returns all existing atproto clients with all their information.
-///
-/// **Permissions**
-/// - rauthy_admin
-#[utoipa::path(
-    get,
-    path = "/atproto/clients",
-    tag = "atproto",
-    responses(
-        (status = 200, description = "Ok", body = OAuthClientMetadata),
-    ),
-)]
-#[tracing::instrument(skip_all)]
-#[get("/atproto/clients")]
-pub async fn get_clients(principal: ReqPrincipal) -> Result<HttpResponse, ErrorResponse> {
-    principal.validate_api_key_or_admin_session(AccessGroup::Clients, AccessRights::Read)?;
+type OAuthClient = atrium_oauth_client::OAuthClient<
+    MemoryStateStore,
+    MemorySessionStore,
+    CommonDidResolver<DefaultHttpClient>,
+    AtprotoHandleResolver<DnsTxtResolver, DefaultHttpClient>,
+>;
 
-    Ok(HttpResponse::Ok().json(Vec::new()))
+#[allow(clippy::type_complexity)]
+static CLIENT: OnceCell<OAuthClient> = OnceCell::const_new();
+
+async fn init_oauth_client(public_url: &str) -> Result<OAuthClient, atrium_oauth_client::Error> {
+    let http_client = Arc::new(DefaultHttpClient::default());
+
+    OAuthClient::new(OAuthClientConfig {
+        client_metadata: AtprotoClientMetadata {
+            client_id: public_url.to_owned(),
+            client_uri: public_url.to_owned(),
+            redirect_uris: vec![format!("{public_url}/auth/v1/atproto/callback")],
+            token_endpoint_auth_method: AuthMethod::PrivateKeyJwt,
+            grant_types: vec![GrantType::AuthorizationCode, GrantType::RefreshToken],
+            scopes: [
+                KnownScope::Atproto,
+                KnownScope::TransitionGeneric,
+                KnownScope::TransitionChatBsky,
+            ]
+            .into_iter()
+            .map(Scope::Known)
+            .collect(),
+            jwks_uri: Some(format!("{public_url}/oidc/certs")),
+            token_endpoint_auth_signing_alg: Some(String::from("ES256")),
+        },
+        keys: None,
+        resolver: OAuthResolverConfig {
+            did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
+                plc_directory_url: DEFAULT_PLC_DIRECTORY_URL.to_string(),
+                http_client: http_client.clone(),
+            }),
+            handle_resolver: AtprotoHandleResolver::new(AtprotoHandleResolverConfig {
+                dns_txt_resolver: DnsTxtResolver::default(),
+                http_client: http_client.clone(),
+            }),
+            authorization_server_metadata: Default::default(),
+            protected_resource_metadata: Default::default(),
+        },
+        state_store: MemoryStateStore::default(),
+        session_store: MemorySessionStore::default(),
+    })
 }
 
-/// Returns a single atproto clients by its *id* with all information's.
+/// Start the login flow for an atproto client
 ///
 /// **Permissions**
-/// - rauthy_admin
-#[utoipa::path(
-    get,
-    path = "/atproto/clients/{id}",
-    tag = "atproto",
-    responses(
-        (status = 200, description = "Ok", body = OAuthClientMetadata),
-    ),
-)]
-#[get("/atproto/clients/{id}")]
-pub async fn get_client_by_id(
-    path: web::Path<String>,
-    principal: ReqPrincipal,
-) -> Result<HttpResponse, ErrorResponse> {
-    principal.validate_api_key_or_admin_session(AccessGroup::Clients, AccessRights::Read)?;
-
-    todo!()
-}
-
-/// Adds a new atproto client to the database.
-///
-/// **Permissions**
-/// - rauthy_admin
+/// - `session-init`
+/// - `session-auth`
 #[utoipa::path(
     post,
-    path = "/atproto/clients",
-    tag = "clients",
-    request_body = atproto::NewClientRequest,
+    path = "/atproto/login",
+    tag = "atproto",
     responses(
-        (status = 200, description = "Ok"),
+        (status = 304, description = "Found"),
     ),
 )]
-#[post("/atproto/clients")]
-pub async fn post_clients(
+#[post("/atproto/login")]
+pub async fn post_login(
     data: web::Data<AppState>,
-    client: actix_web_validator::Json<atproto::NewClientRequest>,
+    payload: Json<atproto::LoginRequest>,
     principal: ReqPrincipal,
 ) -> Result<HttpResponse, ErrorResponse> {
-    principal.validate_api_key_or_admin_session(AccessGroup::Clients, AccessRights::Create)?;
+    principal.validate_session_auth_or_init()?;
 
-    let parts = data.public_url.parse().map(Uri::into_parts);
+    let payload = payload.into_inner();
 
-    let client_id = Uri::from_parts(Parts {
-        path_and_query: Some(format!("/atproto/clients/{id}").parse().expect("todo")),
-        ..parts.expect("invalid public_url in AppState")
-    });
+    let (cookie, xsrf_token, _location) = AuthProviderCallback::login_start(ProviderLoginRequest {
+        email: Some(payload.at_id.clone()),
+        client_id: data.public_url.clone(),
+        redirect_uri: payload.redirect_uri,
+        scopes: payload.scopes,
+        state: payload.state,
+        nonce: None,
+        code_challenge: payload.code_challenge,
+        code_challenge_method: payload.code_challenge_method,
+        provider_id: String::from("atproto"),
+        pkce_challenge: payload.pkce_challenge,
+    })
+    .await?;
 
-    let metadata = OAuthClientMetadata {
-        client_id: client_id.map(Uri::to_string).expect("todo"),
-        client_uri: None,
-        redirect_uris: client.redirect_uris,
-        scope: Some(format!("atproto {}", client.scopes.concat())),
-        grant_types: Some(
-            iter::once("authorization_code".to_owned())
-                .chain(client.grant_types)
-                .collect(),
-        ),
-        token_endpoint_auth_method: Some("private_key_jwt".to_owned()),
-        token_endpoint_auth_signing_alg: Some("ES256".to_owned()),
-        dpop_bound_access_tokens: Some(true),
-        jwks_uri: todo!(),
-        jwks: todo!(),
+    dbg!(&_location);
+
+    let public_url = data.public_url.clone();
+    let client = CLIENT
+        .get_or_try_init(|| async move { init_oauth_client(&public_url).await })
+        .await
+        .unwrap();
+
+    let location = client
+        .authorize(&payload.at_id, AuthorizeOptions::default())
+        .await
+        .unwrap();
+    let location = HeaderValue::from_str(&location).expect("Location HeaderValue to be correct");
+
+    dbg!(&location);
+
+    Ok(HttpResponse::Accepted()
+        .insert_header((LOCATION, location))
+        .cookie(cookie)
+        .body(xsrf_token))
+}
+
+#[utoipa::path(
+    post,
+    path = "/atproto/callback",
+    tag = "atproto",
+    responses(
+        (status = 200, description = "OK", body = ()),
+    ),
+)]
+#[post("/atproto/callback")]
+pub async fn post_callback(
+    data: web::Data<AppState>,
+    req: HttpRequest,
+    payload: Query<atproto::CallbackRequest>,
+    principal: ReqPrincipal,
+) -> Result<HttpResponse, ErrorResponse> {
+    principal.validate_session_auth_or_init()?;
+
+    // Ok(());
+
+    let payload = payload.into_inner();
+    let session = principal.get_session()?;
+
+    AuthProviderCallback::atproto_login_validate(
+        &req,
+        &ProviderCallbackRequest {
+            state: payload.state.clone(),
+            code: payload.code.clone(),
+            xsrf_token: payload.xsrf_token.clone(),
+            pkce_verifier: payload.pkce_verifier.clone(),
+        },
+        session.clone(),
+    )
+    .await?;
+
+    let public_url = data.public_url.clone();
+    let client = CLIENT
+        .get_or_try_init(|| async move { init_oauth_client(&public_url).await })
+        .await
+        .unwrap();
+
+    let params = CallbackParams {
+        code: payload.code.clone(),
+        state: Some(payload.state.clone()),
+        iss: payload.iss.clone(),
     };
+    let (atproto_session, _) = client.callback(params).await.unwrap();
 
-    Ok(HttpResponse::Ok())
+    let token_set = atproto_session.token_set().await.unwrap();
+
+    let ok = ProviderCallbackRequest {
+        state: payload.state,
+        code: payload.code,
+        xsrf_token: payload.xsrf_token,
+        pkce_verifier: payload.pkce_verifier,
+    };
+    let (auth_step, cookie) = AuthProviderCallback::atproto_login_finish(
+        &data,
+        &req,
+        &ok,
+        session.clone(),
+        token_set.sub.as_str(),
+    )
+    .await?;
+
+    let mut resp = map_auth_step(auth_step, &req).await?;
+    resp.add_cookie(&cookie).map_err(|err| {
+        ErrorResponse::new(
+            ErrorResponseType::Internal,
+            format!("Error adding cookie after map_auth_step: {}", err),
+        )
+    })?;
+    Ok(resp)
+}
+
+mod resolvers {
+    use std::error::Error;
+
+    use hickory_resolver::{proto::rr::rdata::TXT, TokioAsyncResolver};
+
+    pub struct DnsTxtResolver {
+        resolver: TokioAsyncResolver,
+    }
+
+    impl Default for DnsTxtResolver {
+        fn default() -> Self {
+            Self {
+                resolver: TokioAsyncResolver::tokio_from_system_conf()
+                    .expect("failed to create resolver"),
+            }
+        }
+    }
+
+    impl atrium_identity::handle::DnsTxtResolver for DnsTxtResolver {
+        async fn resolve(
+            &self,
+            query: &str,
+        ) -> Result<Vec<String>, Box<dyn Error + Send + Sync + 'static>> {
+            let txt_lookup = self.resolver.txt_lookup(query).await?;
+            Ok(txt_lookup.iter().map(TXT::to_string).collect())
+        }
+    }
 }

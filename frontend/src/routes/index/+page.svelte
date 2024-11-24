@@ -10,6 +10,7 @@
 
     let t;
     let renderReg = false;
+    let renderAtproto = false;
 
     onMount(() => {
         const data = window.document.getElementsByName('rauthy-data')[0].id
@@ -26,6 +27,10 @@
         window.location.href = '/auth/v1/account';
     }
 
+    function redirectToAtproto() {
+        window.location.href = '/auth/v1/atproto';
+    }
+
     function redirectToReg() {
         window.location.href = '/auth/v1/users/register';
     }
@@ -40,6 +45,9 @@
         <div class="btn">
             {#if renderReg}
                 <Button on:click={redirectToReg} width={btnWidth}>{t.register.toUpperCase()}</Button>
+            {/if}
+            {#if renderAtproto}
+                <Button on:click={redirectToAtproto} width={btnWidth}>{t.atprotoLogin.toUpperCase()}</Button>
             {/if}
             <Button on:click={redirectToAccount} width={btnWidth}>{t.accountLogin.toUpperCase()}</Button>
             <Button on:click={redirectToAdmin} width={btnWidth}>{t.adminLogin.toUpperCase()}</Button>
