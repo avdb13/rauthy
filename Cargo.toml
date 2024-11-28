@@ -111,9 +111,9 @@ webauthn-rs = { version = "0.5", features = [
 ] }
 webauthn-rs-proto = "0.5"
 
-atrium-api = { git = "https://github.com/avdb13/atrium", rev = "56a9e423db753931671554c354a7f8a18e0ddc85" }
-atrium-identity = { git = "https://github.com/avdb13/atrium", rev = "56a9e423db753931671554c354a7f8a18e0ddc85" }
-atrium-oauth-client = { git = "https://github.com/avdb13/atrium", rev = "56a9e423db753931671554c354a7f8a18e0ddc85" }
-atrium-xrpc = { git = "https://github.com/avdb13/atrium", rev = "56a9e423db753931671554c354a7f8a18e0ddc85" }
+atrium-api = { path = "/home11/avdb31/atrium/atrium-api" }
+atrium-common = { path = "/home11/avdb31/atrium/atrium-common" }
+atrium-identity = { path = "/home11/avdb31/atrium/atrium-oauth/identity" }
+atrium-oauth-client = { path = "/home11/avdb31/atrium/atrium-oauth/oauth-client" }
 
 hickory-resolver = { version = "0.24.1", features = ["tokio", "tokio-rustls", "rustls"] }

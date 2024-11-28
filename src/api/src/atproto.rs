@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use actix_web::{
-    http::header::{HeaderValue, LOCATION},
+    http::{
+        self,
+        header::{HeaderValue, LOCATION},
+    },
     post, web, HttpRequest, HttpResponse,
 };
 use actix_web_validator::{Json, Query};
@@ -97,11 +100,31 @@ pub async fn post_login(
 
     let payload = payload.into_inner();
 
-    let (cookie, xsrf_token, _location) = AuthProviderCallback::login_start(ProviderLoginRequest {
-        email: Some(payload.at_id.clone()),
+    let public_url: http::Uri = data.public_url.parse().expect("public_url is a valid Uri");
+
+    let client_metadata = AtprotoClientMetadata {
         client_id: data.public_url.clone(),
-        redirect_uri: payload.redirect_uri,
-        scopes: payload.scopes,
+        client_uri: public_url.to_owned(),
+        redirect_uris: vec![format!("{public_url}/auth/v1/atproto/callback")],
+        token_endpoint_auth_method: AuthMethod::PrivateKeyJwt,
+        grant_types: vec![GrantType::AuthorizationCode, GrantType::RefreshToken],
+        scopes: [
+            KnownScope::Atproto,
+            KnownScope::TransitionGeneric,
+            KnownScope::TransitionChatBsky,
+        ]
+        .into_iter()
+        .map(Scope::Known)
+        .collect(),
+        jwks_uri: Some(format!("{public_url}/oidc/certs")),
+        token_endpoint_auth_signing_alg: Some(String::from("ES256")),
+    };
+
+    let (cookie, xsrf_token, _location) = AuthProviderCallback::login_start(ProviderLoginRequest {
+        email: None,
+        client_id: String::from("atproto"),
+        redirect_uri: format!("{public_url}/auth/v1/atproto/callback"),
+        scopes: Some([String::from("atproto")].to_vec()),
         state: payload.state,
         nonce: None,
         code_challenge: payload.code_challenge,

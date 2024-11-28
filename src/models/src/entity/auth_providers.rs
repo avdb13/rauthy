@@ -61,6 +61,7 @@ pub enum AuthProviderType {
     Github,
     Google,
     OIDC,
+    Atproto,
 }
 
 impl AuthProviderType {
@@ -70,6 +71,7 @@ impl AuthProviderType {
             Self::Github => "github",
             Self::Google => "google",
             Self::OIDC => "oidc",
+            Self::Atproto => "atproto",
         }
     }
 }
@@ -83,6 +85,7 @@ impl TryFrom<&str> for AuthProviderType {
             "github" => Self::Github,
             "google" => Self::Google,
             "oidc" => Self::OIDC,
+            "atproto" => Self::Atproto,
             _ => {
                 return Err(ErrorResponse::new(
                     ErrorResponseType::BadRequest,
@@ -115,7 +118,7 @@ impl From<rauthy_api_types::auth_providers::AuthProviderType> for AuthProviderTy
 impl From<AuthProviderType> for rauthy_api_types::auth_providers::AuthProviderType {
     fn from(value: AuthProviderType) -> Self {
         match value {
-            AuthProviderType::Custom => Self::Custom,
+            AuthProviderType::Custom | AuthProviderType::Atproto => Self::Custom,
             AuthProviderType::Github => Self::Github,
             AuthProviderType::Google => Self::Google,
             AuthProviderType::OIDC => Self::OIDC,
